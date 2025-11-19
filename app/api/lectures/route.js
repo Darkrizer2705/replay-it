@@ -14,47 +14,111 @@ export async function OPTIONS() {
 export async function POST(req) {
   try {
     const db = await connectDB();
-    const body = await req.json();
 
-    // Support bulk POST (array) or single object
-    if (Array.isArray(body)) {
-      const docs = body.map((item) => ({
-        title: item.title,
-        subject: item.subject,
-        youtubeLink: item.youtubeLink,
-        uploadedAt: item.uploadedAt ? new Date(item.uploadedAt) : new Date(),
-      }));
-
-      const result = await db.collection("lectures").insertMany(docs);
-      const insertedIds = Object.values(result.insertedIds).map((id) => new ObjectId(id));
-      const inserted = await db
-        .collection("lectures")
-        .find({ _id: { $in: insertedIds } })
-        .toArray();
-
-      return new Response(JSON.stringify({ success: true, lectures: inserted }), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    let body;
+    try {
+      body = await req.json();
+    } catch (err) {
+      console.error('Invalid JSON payload', err && err.stack ? err.stack : err);
+      return new Response(JSON.stringify({ ok: false, error: 'Invalid JSON body' }), {
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
-    const doc = {
-      title: body.title,
-      subject: body.subject,
-      youtubeLink: body.youtubeLink,
-      uploadedAt: body.uploadedAt ? new Date(body.uploadedAt) : new Date(),
+    if (body == null) {
+      return new Response(JSON.stringify({ ok: false, error: 'Empty request body' }), {
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const items = Array.isArray(body) ? body : [body];
+
+    // Validate items
+    const errors = [];
+    items.forEach((item, idx) => {
+      if (!item || typeof item !== 'object') {
+        errors.push({ index: idx, error: 'Item must be an object' });
+        return;
+      }
+      if (!item.title || typeof item.title !== 'string' || !item.title.trim()) {
+        errors.push({ index: idx, error: 'Validation error: title required' });
+      }
+      // course or course_name is acceptable
+      if (!item.course && !item.course_name) {
+        errors.push({ index: idx, error: 'Validation error: course required (or course_name)' });
+      }
+      // url or youtubeLink optional but prefer url if present
+    });
+
+    if (errors.length) {
+      return new Response(JSON.stringify({ ok: false, error: 'Validation failed', details: errors }), {
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Normalize documents to store
+    const docs = items.map((p) => {
+      const courseKey = p.course || p.course_name || null;
+      return {
+        id: p.id !== undefined ? p.id : undefined,
+        title: p.title,
+        course: courseKey,
+        course_name: p.course_name || undefined,
+        url: p.url || p.youtubeLink || p.youtube_link || '',
+        date: p.date || undefined,
+        time: p.time || undefined,
+        course_info: p.course_info || (courseKey ? { id: courseKey, name: p.course_name || courseKey } : undefined),
+        raw: p,
+        createdAt: new Date(),
+      };
+    });
+
+    // Deduplicate based on `id` if provided
+    const idsToCheck = docs.filter((d) => d.id !== undefined).map((d) => d.id);
+    const existing = idsToCheck.length
+      ? await db.collection('lectures').find({ id: { $in: idsToCheck } }).project({ id: 1 }).toArray()
+      : [];
+    const existingIds = new Set(existing.map((e) => e.id));
+
+    const toInsert = docs.filter((d) => d.id === undefined || !existingIds.has(d.id));
+
+    let inserted = [];
+    if (toInsert.length > 0) {
+      if (toInsert.length === 1) {
+        const r = await db.collection('lectures').insertOne(toInsert[0]);
+        const doc = await db.collection('lectures').findOne({ _id: r.insertedId });
+        inserted = [doc];
+      } else {
+        const r = await db.collection('lectures').insertMany(toInsert);
+        // fetch inserted docs
+        const insertedIds = Object.values(r.insertedIds);
+        inserted = await db
+          .collection('lectures')
+          .find({ _id: { $in: insertedIds } })
+          .toArray();
+      }
+    }
+
+    const response = {
+      ok: true,
+      inserted: inserted.length,
+      duplicated: docs.length - toInsert.length,
+      lectures: inserted,
     };
 
-    const result = await db.collection("lectures").insertOne(doc);
-    const inserted = await db.collection("lectures").findOne({ _id: result.insertedId });
-
-    return new Response(JSON.stringify({ success: true, lecture: inserted }), {
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    const status = inserted.length > 0 ? 201 : 200;
+    return new Response(JSON.stringify(response), {
+      status,
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     });
   } catch (error) {
-    console.error(error);
-    return new Response(JSON.stringify({ success: false, error: error.message }), {
+    console.error('POST /api/lectures error:', error && error.stack ? error.stack : error);
+    return new Response(JSON.stringify({ ok: false, error: error.message || 'Server error' }), {
       status: 500,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     });
   }
 }
@@ -62,15 +126,16 @@ export async function POST(req) {
 export async function GET() {
   try {
     const db = await connectDB();
-    const lectures = await db.collection("lectures").find({}).sort({ uploadedAt: -1 }).toArray();
-    return new Response(JSON.stringify(lectures), {
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    const lectures = await db.collection('lectures').find({}).sort({ createdAt: -1 }).toArray();
+    // ensure array returned
+    return new Response(JSON.stringify(lectures || []), {
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     });
   } catch (error) {
-    console.error(error);
-    return new Response(JSON.stringify({ error: error.message }), {
+    console.error('GET /api/lectures error:', error && error.stack ? error.stack : error);
+    return new Response(JSON.stringify({ ok: false, error: error.message || 'Server error' }), {
       status: 500,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     });
   }
 }
